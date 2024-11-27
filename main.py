@@ -56,7 +56,7 @@ def entrypoint():
     request_header: Optional[str] = request.headers.get("X-GitHub-Event")
 
     if request_header == "pull_request":
-        handle_pull_requests(payload["payload"])
+        handle_pull_requests(payload)
 
     return "OK"
 

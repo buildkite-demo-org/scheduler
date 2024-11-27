@@ -1,5 +1,8 @@
 import os
 from pybuildkite.buildkite import Buildkite
+from flask import Flask, request
+
+app = Flask(__name__)
 
 
 def get_token():
@@ -14,5 +17,11 @@ def main(token: str):
     buildkite.set_access_token(token)
 
 
-if __name__ == "__main__":
+@app.route("/webhooks", methods=["POST"])
+def entrypoint():
     main(get_token())
+    return "OK"
+
+
+if __name__ == "__main__":
+    app.run()

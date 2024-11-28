@@ -1,11 +1,12 @@
 import time
 from enum import Enum
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 from github import Github, GithubIntegration, CheckRun
 import datetime
 
+from github.GithubObject import NotSet
 from github.Installation import Installation
 from github.PaginatedList import PaginatedList
 from github.PullRequest import PullRequest
@@ -15,35 +16,35 @@ from constants import GITHUB_APP_ID
 
 PRIVATE_KEY_PATH = Path("github_app_private_key.pem").resolve()
 
+
 class Pipeline(str, Enum):
     CHECK = "check"
     GATE = "gate"
+
 
 class CheckRunOutput(Dict[str, str], Enum):
     PENDING_CHECK = {"title": "Check is running", "summary": "..."}
     PENDING_GATE = {"title": "Gate is running", "summary": "..."}
     SUCCESSFUL_CHECK = {
         "title": "Build Results",
-        "summary": "Check completed successfully."
+        "summary": "Check completed successfully.",
     }
     SUCCESSFUL_GATE = {
         "title": "Build Results",
-        "summary": "Gate completed successfully."
+        "summary": "Gate completed successfully.",
     }
-    FAILED_CHECK = {
-        "title": "Build Results",
-        "summary": "Check failed."
-    }
-    FAILED_GATE = {
-        "title": "Build Results",
-        "summary": "Gate failed."
-    }
+    FAILED_CHECK = {"title": "Build Results", "summary": "Check failed."}
+    FAILED_GATE = {"title": "Build Results", "summary": "Gate failed."}
+
+    CANCELED_CHECK = {"title": "Build Results", "summary": "Check canceled."}
+    CANCELED_GATE = {"title": "Build Results", "summary": "Gate canceled."}
 
 
 class CheckRunConclusion(str, Enum):
     SUCCESS = "success"
     FAILURE = "failure"
     NEUTRAL = "neutral"
+    CANCELLED = "cancelled"
 
 
 class CheckRunStatus(str, Enum):
@@ -85,23 +86,30 @@ class GitHubConnector:
 
     @staticmethod
     def get_head_commit_sha_for_pull_request(
-            repo: Repository, pull_request_id: int
+        repo: Repository, pull_request_id: int
     ) -> str:
         pull_request: PullRequest = repo.get_pull(pull_request_id)
         return pull_request.head.sha
 
     def update_checks_page(
-            self,
-            repo_name: str,
-            check_name: Pipeline,
-            pull_request_number: int,
-            status: CheckRunStatus,
-            conclusion: CheckRunConclusion=None,
-            output: CheckRunOutput=None,
+        self,
+        repo_name: str,
+        check_name: Pipeline,
+        pull_request_number: int,
+        status: CheckRunStatus,
+        conclusion: CheckRunConclusion | None = None,
+        completed_at: datetime.datetime | None = None,
+        output: CheckRunOutput | None = None,
     ):
         repo: Repository = self.github.get_repo(repo_name)
-        head_sha: str = self.get_head_commit_sha_for_pull_request(repo, pull_request_number)
-        check_run_tuple: Tuple[str, str, int] = (repo_name, check_name, pull_request_number)
+        head_sha: str = self.get_head_commit_sha_for_pull_request(
+            repo, pull_request_number
+        )
+        check_run_tuple: Tuple[str, str, int] = (
+            repo_name,
+            check_name,
+            pull_request_number,
+        )
 
         if check_run_tuple in self.pr_id_to_check_run_id_dict.keys():
             check_run_id: int = self.pr_id_to_check_run_id_dict[check_run_tuple]
@@ -110,8 +118,13 @@ class GitHubConnector:
                 check_run_id=check_run_id,
                 status=status,
                 conclusion=conclusion,
+                completed_at=completed_at,
                 output=output,
             )
+
+            if conclusion and completed_at:
+                del self.pr_id_to_check_run_id_dict[check_run_tuple]
+
         else:
             check_run_id: int = self.init_checks_page(
                 repository=repo,
@@ -124,11 +137,11 @@ class GitHubConnector:
 
     @staticmethod
     def init_checks_page(
-            repository: Repository,
-            check_name: str,
-            commit_sha: str,
-            status: str,
-            output: Dict,
+        repository: Repository,
+        check_name: str,
+        commit_sha: str,
+        status: str,
+        output: Dict,
     ) -> int:
         check_run: CheckRun = repository.create_check_run(
             name=check_name,
@@ -142,12 +155,15 @@ class GitHubConnector:
 
     @staticmethod
     def edit_checks_page(
-            repository: Repository,
-            check_run_id: int,
-            status: str,
-            conclusion: str,
-            output: Dict,
+        repository: Repository,
+        check_run_id: int,
+        status: str,
+        conclusion: str | None = None,
+        completed_at: datetime.datetime | None = None,
+        output: Dict | None = None,
     ):
+        completed_at = completed_at or NotSet
+        conclusion = conclusion or NotSet
         check_run: CheckRun = repository.get_check_run(check_run_id)
         check_run.edit(
             name=check_run.name,
@@ -157,7 +173,7 @@ class GitHubConnector:
             status=status,
             started_at=check_run.started_at,
             conclusion=conclusion,
-            completed_at=datetime.datetime.utcnow(),
+            completed_at=completed_at,
             output=output,
         )
         check_run.update()

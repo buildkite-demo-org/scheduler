@@ -5,6 +5,7 @@ from pybuildkite.buildkite import Buildkite
 from flask import Flask, request
 from dotenv import load_dotenv
 from constants import BUILDKITE_ORGANISATION, BAZEL_BUILD_PIPELINE
+from github_connector import GitHubConnector, CheckRunStatus, Pipeline, CheckRunOutput
 
 app = Flask(__name__)
 
@@ -37,7 +38,7 @@ def extract_branch_name_from_payload(pr_json_payload: Dict[str, Any]) -> str:
 
 
 def trigger_build(
-    buildkite: Buildkite, commit_sha: str, branch: str, build_message: str
+        buildkite: Buildkite, commit_sha: str, branch: str, build_message: str
 ) -> None:
     buildkite.builds().create_build(
         BUILDKITE_ORGANISATION,
@@ -49,11 +50,29 @@ def trigger_build(
     )
 
 
+def extract_repository_name(pr_json_payload: Dict[str, Any]) -> str:
+    return pr_json_payload["repository"]["full_name"]
+
+
+def extract_pr_number(pr_json_payload: Dict[str, Any]) -> int:
+    return int(pr_json_payload["number"])
+
+
 def handle_pull_requests(pr_json_payload: Dict[str, Any]) -> None:
     buildkite: Buildkite = setup_buildkite(get_token())
+    github_connector: GitHubConnector = GitHubConnector()
     action: str = pr_json_payload["action"]
+    repository_name: str = extract_repository_name(pr_json_payload)
+    pull_request_number: int = extract_pr_number(pr_json_payload)
 
     if is_pull_request_changed(action):
+        github_connector.update_checks_page(
+            repo_name=repository_name,
+            check_name=Pipeline.CHECK,
+            pull_request_number=pull_request_number,
+            status=CheckRunStatus.QUEUED,
+            output=CheckRunOutput.PENDING_CHECK
+        )
         build_message: str = generate_build_message_from_payload(pr_json_payload)
         branch: str = extract_branch_name_from_payload(pr_json_payload)
         trigger_build(
@@ -61,13 +80,21 @@ def handle_pull_requests(pr_json_payload: Dict[str, Any]) -> None:
         )
 
 
-@app.route("/webhooks", methods=["POST"])
-def entrypoint():
+@app.route("/github_webhooks", methods=["POST"])
+def github_entrypoint():
     payload: Dict[str, Any] = request.get_json()
     request_header: Optional[str] = request.headers.get("X-GitHub-Event")
 
     if request_header == "pull_request":
         handle_pull_requests(payload)
+
+    return "OK"
+
+
+@app.route("/buildkite_webhooks", methods=["POST"])
+def buildkite_entrypoint():
+    payload: Dict[str, Any] = request.get_json()
+    request_header: Optional[str] = request.headers.get("X-GitHub-Event")
 
     return "OK"
 

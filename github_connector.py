@@ -1,4 +1,5 @@
 import time
+from enum import Enum
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -12,8 +13,43 @@ from github.Repository import Repository
 
 from constants import GITHUB_APP_ID
 
-# Constants
 PRIVATE_KEY_PATH = Path("github_app_private_key.pem").resolve()
+
+class Pipeline(str, Enum):
+    CHECK = "check"
+    GATE = "gate"
+
+class CheckRunOutput(Dict[str, str], Enum):
+    PENDING_CHECK = {"title": "Check is running", "summary": "..."}
+    PENDING_GATE = {"title": "Gate is running", "summary": "..."}
+    SUCCESSFUL_CHECK = {
+        "title": "Build Results",
+        "summary": "Check completed successfully."
+    }
+    SUCCESSFUL_GATE = {
+        "title": "Build Results",
+        "summary": "Gate completed successfully."
+    }
+    FAILED_CHECK = {
+        "title": "Build Results",
+        "summary": "Check failed."
+    }
+    FAILED_GATE = {
+        "title": "Build Results",
+        "summary": "Gate failed."
+    }
+
+
+class CheckRunConclusion(str, Enum):
+    SUCCESS = "success"
+    FAILURE = "failure"
+    NEUTRAL = "neutral"
+
+
+class CheckRunStatus(str, Enum):
+    COMPLETED = "completed"
+    IN_PROGRESS = "in_progress"
+    QUEUED = "queued"
 
 
 class GitHubConnector:
@@ -24,8 +60,8 @@ class GitHubConnector:
             GITHUB_APP_ID, self.installation.id, private_key
         )
         self.pr_id_to_check_run_id_dict: Dict[
-            (int, str), int
-        ] = {}  # (pr_id, check_name) -> check_run_id
+            (str, str, int), int
+        ] = {}  # (repo_name, check_name, pr_number) -> check_run_id
 
     @staticmethod
     def read_private_key(private_key_path: Path) -> str:
@@ -49,23 +85,23 @@ class GitHubConnector:
 
     @staticmethod
     def get_head_commit_sha_for_pull_request(
-        repo: Repository, pull_request_id: int
+            repo: Repository, pull_request_id: int
     ) -> str:
         pull_request: PullRequest = repo.get_pull(pull_request_id)
         return pull_request.head.sha
 
     def update_checks_page(
-        self,
-        repo_name,
-        check_name,
-        pull_request_id,
-        status,
-        conclusion=None,
-        output=None,
+            self,
+            repo_name: str,
+            check_name: Pipeline,
+            pull_request_number: int,
+            status: CheckRunStatus,
+            conclusion: CheckRunConclusion=None,
+            output: CheckRunOutput=None,
     ):
         repo: Repository = self.github.get_repo(repo_name)
-        head_sha: str = self.get_head_commit_sha_for_pull_request(repo, pull_request_id)
-        check_run_tuple: Tuple[int, str] = (pull_request_id, check_name)
+        head_sha: str = self.get_head_commit_sha_for_pull_request(repo, pull_request_number)
+        check_run_tuple: Tuple[str, str, int] = (repo_name, check_name, pull_request_number)
 
         if check_run_tuple in self.pr_id_to_check_run_id_dict.keys():
             check_run_id: int = self.pr_id_to_check_run_id_dict[check_run_tuple]
@@ -88,11 +124,11 @@ class GitHubConnector:
 
     @staticmethod
     def init_checks_page(
-        repository: Repository,
-        check_name: str,
-        commit_sha: str,
-        status: str,
-        output: Dict,
+            repository: Repository,
+            check_name: str,
+            commit_sha: str,
+            status: str,
+            output: Dict,
     ) -> int:
         check_run: CheckRun = repository.create_check_run(
             name=check_name,
@@ -106,11 +142,11 @@ class GitHubConnector:
 
     @staticmethod
     def edit_checks_page(
-        repository: Repository,
-        check_run_id: int,
-        status: str,
-        conclusion: str,
-        output: Dict,
+            repository: Repository,
+            check_run_id: int,
+            status: str,
+            conclusion: str,
+            output: Dict,
     ):
         check_run: CheckRun = repository.get_check_run(check_run_id)
         check_run.edit(
@@ -133,65 +169,47 @@ def demo_github_connector():
     repo_name = "buildkite-demo-org/scheduler"  # Replace with your repository name
 
     # Check
-    output = {"title": "Check is running", "summary": "..."}
     github.update_checks_page(
         repo_name=repo_name,
-        check_name="check",
-        pull_request_id=3,
-        status="in_progress",
+        check_name=Pipeline.CHECK,
+        pull_request_number=3,
+        status=CheckRunStatus.IN_PROGRESS,
         conclusion=None,
-        output=output,
+        output=CheckRunOutput.PENDING_CHECK,
     )
 
     time.sleep(5)
 
-    build_successful = True
-    output = {
-        "title": "Build Results",
-        "summary": "The build completed successfully."
-        if build_successful
-        else "The build failed.",
-    }
-    conclusion = "success" if build_successful else "failure"
     github.update_checks_page(
         repo_name=repo_name,
-        check_name="check",
-        pull_request_id=3,
-        status="completed",
-        conclusion=conclusion,
-        output=output,
+        check_name=Pipeline.CHECK,
+        pull_request_number=3,
+        status=CheckRunStatus.COMPLETED,
+        conclusion=CheckRunConclusion.SUCCESS,
+        output=CheckRunOutput.SUCCESSFUL_CHECK,
     )
 
     time.sleep(1)
 
     # Gate
-    output = {"title": "Gate is running", "summary": "..."}
     github.update_checks_page(
         repo_name=repo_name,
-        check_name="gate",
-        pull_request_id=3,
-        status="in_progress",
+        check_name=Pipeline.GATE,
+        pull_request_number=3,
+        status=CheckRunStatus.IN_PROGRESS,
         conclusion=None,
-        output=output,
+        output=CheckRunOutput.PENDING_GATE,
     )
 
     time.sleep(5)
 
-    build_successful = False
-    output = {
-        "title": "Build Results",
-        "summary": "The build completed successfully."
-        if build_successful
-        else "The build failed.",
-    }
-    conclusion = "success" if build_successful else "failure"
     github.update_checks_page(
         repo_name=repo_name,
-        check_name="gate",
-        pull_request_id=3,
-        status="completed",
-        conclusion=conclusion,
-        output=output,
+        check_name=Pipeline.GATE,
+        pull_request_number=3,
+        status=CheckRunStatus.COMPLETED,
+        conclusion=CheckRunConclusion.FAILURE,
+        output=CheckRunOutput.FAILED_GATE,
     )
 
 

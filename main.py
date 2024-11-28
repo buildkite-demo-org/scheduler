@@ -31,13 +31,22 @@ def generate_build_message_from_payload(pr_json_payload: Dict[str, Any]) -> str:
     pr_nr: int = int(pr_json_payload["pull_request"]["number"])
     return f"Build for Pull Request: {pr_nr}"
 
+
 def extract_branch_name_from_payload(pr_json_payload: Dict[str, Any]) -> str:
     return pr_json_payload["pull_request"]["head"]["ref"]
 
 
-def trigger_build(buildkite: Buildkite, commit_sha: str, branch: str, build_message: str) -> None:
-    buildkite.builds().create_build(BUILDKITE_ORGANISATION, BAZEL_BUILD_PIPELINE, commit_sha, branch,
-                                    clean_checkout=True, message=build_message)
+def trigger_build(
+    buildkite: Buildkite, commit_sha: str, branch: str, build_message: str
+) -> None:
+    buildkite.builds().create_build(
+        BUILDKITE_ORGANISATION,
+        BAZEL_BUILD_PIPELINE,
+        commit_sha,
+        branch,
+        clean_checkout=True,
+        message=build_message,
+    )
 
 
 def handle_pull_requests(pr_json_payload: Dict[str, Any]) -> None:
@@ -47,7 +56,9 @@ def handle_pull_requests(pr_json_payload: Dict[str, Any]) -> None:
     if is_pull_request_changed(action):
         build_message: str = generate_build_message_from_payload(pr_json_payload)
         branch: str = extract_branch_name_from_payload(pr_json_payload)
-        trigger_build(buildkite, commit_sha="HEAD", branch=branch, build_message=build_message)
+        trigger_build(
+            buildkite, commit_sha="HEAD", branch=branch, build_message=build_message
+        )
 
 
 @app.route("/webhooks", methods=["POST"])

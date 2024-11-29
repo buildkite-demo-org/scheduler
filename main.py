@@ -82,31 +82,27 @@ def extract_repository_name(pr_json_payload: Dict[str, Any]) -> str:
     return pr_json_payload["repository"]["full_name"]
 
 
-def extract_pr_number(pr_json_payload: Dict[str, Any]) -> int:
-    return int(pr_json_payload["number"])
-
-
 def handle_pull_requests(pr_json_payload: Dict[str, Any]) -> None:
     action: str = pr_json_payload["action"]
     repository_name: str = extract_repository_name(pr_json_payload)
-    pull_request_number: int = extract_pr_number(pr_json_payload)
+    head_sha: int = pr_json_payload["pull_request"]["head"]["sha"]
 
     if is_pull_request_changed(action):
         GITHUB_CONNECTOR.update_checks_page(
             repo_name=repository_name,
             check_name=Pipeline.CHECK,
-            pull_request_number=pull_request_number,
+            commit_sha=head_sha,
             status=CheckRunStatus.QUEUED,
             output=CheckRunOutput.PENDING_CHECK,
         )
         build_message: str = generate_build_message_from_payload(pr_json_payload)
         branch: str = extract_branch_name_from_payload(pr_json_payload)
         build_list: List[Any] = trigger_build(
-            BUILDKITE, repository_name=repository_name, commit_sha="HEAD", branch=branch, build_message=build_message
+            BUILDKITE, repository_name=repository_name, commit_sha=head_sha, branch=branch, build_message=build_message
         )
 
         for build in build_list:
-            BUILDS[build["id"]] = (build, pr_json_payload)
+            BUILDS[build["id"]] = (build, repository_name, head_sha)
 
 
 def handle_check_run(check_run_payload: Dict[str, Any]) -> None:
@@ -129,18 +125,31 @@ def handle_check_suite(check_suite_payload: Dict[str, Any]) -> None:
     action: str = check_suite_payload["action"]
     app: str = check_suite_payload["check_suite"]["app"]["slug"]
     
+    print(f"check_suite event triggered for app {app} with action {action}")
+
     if action == "requested" and app == "buildkite-scheduler":
         repository_name: str = check_suite_payload["repository"]["full_name"]
         branch: str = check_suite_payload["check_suite"]["head_branch"]
         sha: str = check_suite_payload["check_suite"]["head_sha"]
         message: str = check_suite_payload["check_suite"]["head_commit"]["message"]
-    
-        build_list: List[Any] = trigger_build(BUILDKITE, repository_name=repository_name, commit_sha=sha, branch=branch, build_message=message)
-        
-        # TODO: fill global builds with new build
-        # for build in build_list:
-        #     BUILDS[build["id"]] = (build, pr_json_payload)
 
+        print(f"Triggering build for commit sha {sha}")
+        build_list: List[Any] = trigger_build(BUILDKITE, repository_name=repository_name, commit_sha=sha, branch=branch, build_message=message)
+
+        for build in build_list:
+            BUILDS[build["id"]] = (build, repository_name, sha)
+
+def handle_pull_request_review(review_payload: Dict[str, Any]) -> None:
+    action: str = review_payload["action"]
+    review: str = review_payload["review"]["state"]
+    repo_name: str = review_payload["repository"]["full_name"]
+    pr_number: str = review_payload["pull_request"]["number"]
+    
+    if action == "submitted" and review == "approved":
+        if GITHUB_CONNECTOR.attempt_merge(repo_name=repo_name, pr_number=pr_number):
+            print(f"Pull Request: #{pr_number} was merged!")
+        else: 
+            print(f"Pull request #{pr_number} not ready to merge!")
 
 
 @app.route("/github_webhooks", methods=["POST"])
@@ -156,6 +165,9 @@ def github_entrypoint():
         
     if request_header == "check_suite":
         handle_check_suite(payload)
+        
+    if request_header == "pull_request_review":
+        handle_pull_request_review(payload)
 
     return "OK"
 
@@ -165,16 +177,14 @@ def handle_build_running(payload: Dict[str, Any]):
 
     if build_id in BUILDS:
         print(f"Build {build_id} running!")
-        _, pull_request = BUILDS[build_id]
-        repository = pull_request["repository"]["full_name"]
+        _, repo_name, commit_sha = BUILDS[build_id]
         check_name = Pipeline.CHECK
-        pr_number = pull_request["number"]
         status = CheckRunStatus.IN_PROGRESS
         # output = CheckRunOutput.PENDING_CHECK
         GITHUB_CONNECTOR.update_checks_page(
-            repo_name=repository,
+            repo_name=repo_name,
             check_name=check_name,
-            pull_request_number=pr_number,
+            commit_sha=commit_sha,
             status=status,
             conclusion=None,
             completed_at=None,
@@ -203,19 +213,17 @@ def handle_build_finished(payload: Dict[str, Any]):
 
     if build_id in BUILDS:
         print(f"Build {build_id} has finished with result {conclusion}!")
-        _, pull_request = BUILDS[build_id]
-        repository = pull_request["repository"]["full_name"]
+        _, repo_name, commit_sha = BUILDS[build_id]
         check_name = Pipeline.CHECK
-        pr_number = pull_request["number"]
         status = CheckRunStatus.COMPLETED
         conclusion = conclusion
         completed_at = datetime.datetime.strptime(payload["build"]["finished_at"], "%Y-%m-%dT%H:%M:%S.%fZ")
         output = output
 
         GITHUB_CONNECTOR.update_checks_page(
-            repo_name=repository,
+            repo_name=repo_name,
             check_name=check_name,
-            pull_request_number=pr_number,
+            commit_sha=commit_sha,
             status=status,
             conclusion=conclusion,
             completed_at=completed_at,

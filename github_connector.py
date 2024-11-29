@@ -6,6 +6,7 @@ from typing import Dict, Optional, Tuple
 from github import Github, GithubIntegration, CheckRun
 import datetime
 
+from github.GithubException import GithubException
 from github.CheckSuite import CheckSuite
 from github.GithubObject import NotSet
 from github.Installation import Installation
@@ -13,6 +14,7 @@ from github.PaginatedList import PaginatedList
 from github.PullRequest import PullRequest
 from github.PullRequestMergeStatus import PullRequestMergeStatus
 from github.Repository import Repository
+import requests
 
 from constants import GITHUB_APP_ID
 
@@ -57,6 +59,7 @@ class CheckRunStatus(str, Enum):
 
 class GitHubConnector:
     def __init__(self):
+        self.graphql_url = "https://api.github.com/graphql"
         self.installation: Installation = self.fetch_installation()
         private_key: str = self.read_private_key(PRIVATE_KEY_PATH)
         self.github = self.authenticate_as_github_app(
@@ -185,9 +188,38 @@ class GitHubConnector:
         pull_request: PullRequest = repo.get_pull(pr_number)
 
         if pull_request.mergeable:
-            pull_request.merge()
-            return True
+            # Please don't look at this
+            try:
+                pull_request.merge()
+                return True
+            except GithubException:
+                self.enqueue_pull_request(pull_request.node_id)
+                return True
         return False
+
+    def enqueue_pull_request(self, pull_request_id: str):
+        graphql_query = """
+        mutation {
+            enqueuePullRequest(input: {pullRequestId: "%s"}){
+                clientMutationId
+                mergeQueueEntry {
+                    id
+                    pullRequest {
+                        title
+                        number
+                    }
+                }
+            }
+        }
+        """
+        query = {"query": graphql_query % pull_request_id}
+        headers = {"Authorization": f"bearer %s" % self.github.requester.auth.token}
+        response = requests.post(
+            url=self.graphql_url,
+            json=query,
+            headers=headers,
+        )
+        response.raise_for_status()
 
 
 # Main function to be called with the necessary parameters

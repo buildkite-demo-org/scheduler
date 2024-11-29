@@ -116,10 +116,31 @@ def handle_check_run(check_run_payload: Dict[str, Any]) -> None:
 
     if action == CheckRunStatus.COMPLETED and pipeline == Pipeline.CHECK and conclusion == CheckRunConclusion.SUCCESS:
         repo_name: str = check_run_payload["repository"]["full_name"]
+        if not check_run_payload["check_run"]["pull_requests"]:
+            print("No pull request found for check run!")
+            return
+
         pr_number: int = int(check_run_payload["check_run"]["pull_requests"][0]["number"])
 
         if GITHUB_CONNECTOR.attempt_merge(repo_name=repo_name, pr_number=pr_number):
             print(f"Pull Request: #{pr_number} was merged!")
+
+def handle_check_suite(check_suite_payload: Dict[str, Any]) -> None:
+    action: str = check_suite_payload["action"]
+    app: str = check_suite_payload["check_suite"]["app"]["slug"]
+    
+    if action == "requested" and app == "buildkite-scheduler":
+        repository_name: str = check_suite_payload["repository"]["full_name"]
+        branch: str = check_suite_payload["check_suite"]["head_branch"]
+        sha: str = check_suite_payload["check_suite"]["head_sha"]
+        message: str = check_suite_payload["check_suite"]["head_commit"]["message"]
+    
+        build_list: List[Any] = trigger_build(BUILDKITE, repository_name=repository_name, commit_sha=sha, branch=branch, build_message=message)
+        
+        # TODO: fill global builds with new build
+        # for build in build_list:
+        #     BUILDS[build["id"]] = (build, pr_json_payload)
+
 
 
 @app.route("/github_webhooks", methods=["POST"])
@@ -132,6 +153,9 @@ def github_entrypoint():
 
     if request_header == "check_run":
         handle_check_run(payload)
+        
+    if request_header == "check_suite":
+        handle_check_suite(payload)
 
     return "OK"
 

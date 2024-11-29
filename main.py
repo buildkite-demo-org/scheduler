@@ -1,10 +1,12 @@
 import os
+import datetime
 from typing import Dict, Any, Optional
 
 from pybuildkite.buildkite import Buildkite
 from flask import Flask, request
 from dotenv import load_dotenv
 from constants import BUILDKITE_ORGANISATION, BAZEL_BUILD_PIPELINE
+from github_connector import CheckRunConclusion, GitHubConnector, CheckRunStatus, Pipeline, CheckRunOutput
 
 app = Flask(__name__)
 
@@ -23,8 +25,14 @@ def setup_buildkite(token: str) -> Buildkite:
     return buildkite
 
 
+buildkite: Buildkite = setup_buildkite(get_token())
+github_connector: GitHubConnector = GitHubConnector()
+
+builds = {}
+
+
 def is_pull_request_changed(action: str) -> bool:
-    return action in ["opened", "synchronize"]
+    return action in ["opened", "reopened", "synchronize"]
 
 
 def generate_build_message_from_payload(pr_json_payload: Dict[str, Any]) -> str:
@@ -38,8 +46,8 @@ def extract_branch_name_from_payload(pr_json_payload: Dict[str, Any]) -> str:
 
 def trigger_build(
     buildkite: Buildkite, commit_sha: str, branch: str, build_message: str
-) -> None:
-    buildkite.builds().create_build(
+) -> Any:
+    return buildkite.builds().create_build(
         BUILDKITE_ORGANISATION,
         BAZEL_BUILD_PIPELINE,
         commit_sha,
@@ -49,20 +57,37 @@ def trigger_build(
     )
 
 
+def extract_repository_name(pr_json_payload: Dict[str, Any]) -> str:
+    return pr_json_payload["repository"]["full_name"]
+
+
+def extract_pr_number(pr_json_payload: Dict[str, Any]) -> int:
+    return int(pr_json_payload["number"])
+
+
 def handle_pull_requests(pr_json_payload: Dict[str, Any]) -> None:
-    buildkite: Buildkite = setup_buildkite(get_token())
     action: str = pr_json_payload["action"]
+    repository_name: str = extract_repository_name(pr_json_payload)
+    pull_request_number: int = extract_pr_number(pr_json_payload)
 
     if is_pull_request_changed(action):
+        github_connector.update_checks_page(
+            repo_name=repository_name,
+            check_name=Pipeline.CHECK,
+            pull_request_number=pull_request_number,
+            status=CheckRunStatus.QUEUED,
+            output=CheckRunOutput.PENDING_CHECK,
+        )
         build_message: str = generate_build_message_from_payload(pr_json_payload)
         branch: str = extract_branch_name_from_payload(pr_json_payload)
-        trigger_build(
+        build = trigger_build(
             buildkite, commit_sha="HEAD", branch=branch, build_message=build_message
         )
+        builds[build["id"]] = (build, pr_json_payload)
 
 
-@app.route("/webhooks", methods=["POST"])
-def entrypoint():
+@app.route("/github_webhooks", methods=["POST"])
+def github_entrypoint():
     payload: Dict[str, Any] = request.get_json()
     request_header: Optional[str] = request.headers.get("X-GitHub-Event")
 
@@ -72,8 +97,92 @@ def entrypoint():
     return "OK"
 
 
+def handle_build_running(payload: Dict[str, Any]):
+    build_id = payload["build"]["id"]
+
+    if build_id in builds:
+        print(f"Build {build_id} running!")
+        _, pull_request = builds[build_id]
+        repository = pull_request["repository"]["full_name"]
+        check_name = Pipeline.CHECK
+        pr_number = pull_request["number"]
+        status = CheckRunStatus.IN_PROGRESS
+        # output = CheckRunOutput.PENDING_CHECK
+        github_connector.update_checks_page(
+            repo_name=repository,
+            check_name=check_name,
+            pull_request_number=pr_number,
+            status=status,
+            conclusion=None,
+            completed_at=None,
+            output={"title": "Check is running", "summary": f"Build URL: {payload["build"]["web_url"]}"},
+        )
+
+
+def handle_build_finished(payload: Dict[str, Any]):
+    build_id = payload["build"]["id"]
+    build_result = payload["build"]["state"]
+    
+    if build_result == "passed":
+        conclusion = CheckRunConclusion.SUCCESS
+        output = CheckRunOutput.SUCCESSFUL_CHECK
+    
+    elif build_result == "canceled":
+        conclusion = CheckRunConclusion.CANCELLED
+        output = CheckRunOutput.CANCELED_CHECK
+    
+    elif build_result == "failed":
+        conclusion = CheckRunConclusion.FAILURE
+        output = CheckRunOutput.FAILED_CHECK
+    else:
+        print(f"Unhandled build result {build_result}")
+        return
+
+    if build_id in builds:
+        print(f"Build {build_id} has finished with result {conclusion}!")
+        _, pull_request = builds[build_id]
+        repository = pull_request["repository"]["full_name"]
+        check_name = Pipeline.CHECK
+        pr_number = pull_request["number"]
+        status = CheckRunStatus.COMPLETED
+        conclusion = conclusion
+        completed_at = datetime.datetime.strptime(payload["build"]["finished_at"], "%Y-%m-%dT%H:%M:%S.%fZ")
+        output = output
+        
+        github_connector.update_checks_page(
+            repo_name=repository,
+            check_name=check_name,
+            pull_request_number=pr_number,
+            status=status,
+            conclusion=conclusion,
+            completed_at=completed_at,
+            output=output,
+        )
+        
+        del builds[build_id]
+
+
+
+def handle_build_canceled(payload: Dict[str, Any]):
+    pass
+
+
+@app.route("/buildkite_webhooks", methods=["POST"])
+def buildkite_entrypoint():
+    payload: Dict[str, Any] = request.get_json()
+    request_header: Optional[str] = request.headers.get("X-Buildkite-Event")
+
+    if request_header == "build.running":
+        handle_build_running(payload)
+
+    elif request_header == "build.finished":
+        handle_build_finished(payload)
+
+    elif request_header == "build.failing":
+        handle_build_failing(payload)
+
+    return "OK"
+
+
 if __name__ == "__main__":
     app.run(port=5000)
-    # payload = {"event":"pull_request","payload":{"action":"opened","number":4,"pull_request":{"url":"https://api.github.com/repos/buildkite-demo-org/bazel/pulls/4","id":2203734378,"node_id":"PR_kwDONNouas6DWlFq","html_url":"https://github.com/buildkite-demo-org/bazel/pull/4","diff_url":"https://github.com/buildkite-demo-org/bazel/pull/4.diff","patch_url":"https://github.com/buildkite-demo-org/bazel/pull/4.patch","issue_url":"https://api.github.com/repos/buildkite-demo-org/bazel/issues/4","number":4,"state":"open","locked":False,"title":"Update README.md","user":{"login":"simonrummert","id":43201070,"node_id":"MDQ6VXNlcjQzMjAxMDcw","avatar_url":"https://avatars.githubusercontent.com/u/43201070?v=4","gravatar_id":"","url":"https://api.github.com/users/simonrummert","html_url":"https://github.com/simonrummert","followers_url":"https://api.github.com/users/simonrummert/followers","following_url":"https://api.github.com/users/simonrummert/following{/other_user}","gists_url":"https://api.github.com/users/simonrummert/gists{/gist_id}","starred_url":"https://api.github.com/users/simonrummert/starred{/owner}{/repo}","subscriptions_url":"https://api.github.com/users/simonrummert/subscriptions","organizations_url":"https://api.github.com/users/simonrummert/orgs","repos_url":"https://api.github.com/users/simonrummert/repos","events_url":"https://api.github.com/users/simonrummert/events{/privacy}","received_events_url":"https://api.github.com/users/simonrummert/received_events","type":"User","user_view_type":"public","site_admin":False},"body":None,"created_at":"2024-11-27T15:19:06Z","updated_at":"2024-11-27T15:19:06Z","closed_at":None,"merged_at":None,"merge_commit_sha":None,"assignee":None,"assignees":[],"requested_reviewers":[],"requested_teams":[],"labels":[],"milestone":None,"draft":False,"commits_url":"https://api.github.com/repos/buildkite-demo-org/bazel/pulls/4/commits","review_comments_url":"https://api.github.com/repos/buildkite-demo-org/bazel/pulls/4/comments","review_comment_url":"https://api.github.com/repos/buildkite-demo-org/bazel/pulls/comments{/number}","comments_url":"https://api.github.com/repos/buildkite-demo-org/bazel/issues/4/comments","statuses_url":"https://api.github.com/repos/buildkite-demo-org/bazel/statuses/9093e68d670fe57cb5423cfc56ff5ab483c873aa","head":{"label":"buildkite-demo-org:simonrummert-patch-2","ref":"simonrummert-patch-2","sha":"9093e68d670fe57cb5423cfc56ff5ab483c873aa","user":{"login":"buildkite-demo-org","id":188066006,"node_id":"O_kgDOCzWo1g","avatar_url":"https://avatars.githubusercontent.com/u/188066006?v=4","gravatar_id":"","url":"https://api.github.com/users/buildkite-demo-org","html_url":"https://github.com/buildkite-demo-org","followers_url":"https://api.github.com/users/buildkite-demo-org/followers","following_url":"https://api.github.com/users/buildkite-demo-org/following{/other_user}","gists_url":"https://api.github.com/users/buildkite-demo-org/gists{/gist_id}","starred_url":"https://api.github.com/users/buildkite-demo-org/starred{/owner}{/repo}","subscriptions_url":"https://api.github.com/users/buildkite-demo-org/subscriptions","organizations_url":"https://api.github.com/users/buildkite-demo-org/orgs","repos_url":"https://api.github.com/users/buildkite-demo-org/repos","events_url":"https://api.github.com/users/buildkite-demo-org/events{/privacy}","received_events_url":"https://api.github.com/users/buildkite-demo-org/received_events","type":"Organization","user_view_type":"public","site_admin":False},"repo":{"id":886713962,"node_id":"R_kgDONNouag","name":"bazel","full_name":"buildkite-demo-org/bazel","private":False,"owner":{"login":"buildkite-demo-org","id":188066006,"node_id":"O_kgDOCzWo1g","avatar_url":"https://avatars.githubusercontent.com/u/188066006?v=4","gravatar_id":"","url":"https://api.github.com/users/buildkite-demo-org","html_url":"https://github.com/buildkite-demo-org","followers_url":"https://api.github.com/users/buildkite-demo-org/followers","following_url":"https://api.github.com/users/buildkite-demo-org/following{/other_user}","gists_url":"https://api.github.com/users/buildkite-demo-org/gists{/gist_id}","starred_url":"https://api.github.com/users/buildkite-demo-org/starred{/owner}{/repo}","subscriptions_url":"https://api.github.com/users/buildkite-demo-org/subscriptions","organizations_url":"https://api.github.com/users/buildkite-demo-org/orgs","repos_url":"https://api.github.com/users/buildkite-demo-org/repos","events_url":"https://api.github.com/users/buildkite-demo-org/events{/privacy}","received_events_url":"https://api.github.com/users/buildkite-demo-org/received_events","type":"Organization","user_view_type":"public","site_admin":False},"html_url":"https://github.com/buildkite-demo-org/bazel","description":"a fast, scalable, multi-language and extensible build system","fork":True,"url":"https://api.github.com/repos/buildkite-demo-org/bazel","forks_url":"https://api.github.com/repos/buildkite-demo-org/bazel/forks","keys_url":"https://api.github.com/repos/buildkite-demo-org/bazel/keys{/key_id}","collaborators_url":"https://api.github.com/repos/buildkite-demo-org/bazel/collaborators{/collaborator}","teams_url":"https://api.github.com/repos/buildkite-demo-org/bazel/teams","hooks_url":"https://api.github.com/repos/buildkite-demo-org/bazel/hooks","issue_events_url":"https://api.github.com/repos/buildkite-demo-org/bazel/issues/events{/number}","events_url":"https://api.github.com/repos/buildkite-demo-org/bazel/events","assignees_url":"https://api.github.com/repos/buildkite-demo-org/bazel/assignees{/user}","branches_url":"https://api.github.com/repos/buildkite-demo-org/bazel/branches{/branch}","tags_url":"https://api.github.com/repos/buildkite-demo-org/bazel/tags","blobs_url":"https://api.github.com/repos/buildkite-demo-org/bazel/git/blobs{/sha}","git_tags_url":"https://api.github.com/repos/buildkite-demo-org/bazel/git/tags{/sha}","git_refs_url":"https://api.github.com/repos/buildkite-demo-org/bazel/git/refs{/sha}","trees_url":"https://api.github.com/repos/buildkite-demo-org/bazel/git/trees{/sha}","statuses_url":"https://api.github.com/repos/buildkite-demo-org/bazel/statuses/{sha}","languages_url":"https://api.github.com/repos/buildkite-demo-org/bazel/languages","stargazers_url":"https://api.github.com/repos/buildkite-demo-org/bazel/stargazers","contributors_url":"https://api.github.com/repos/buildkite-demo-org/bazel/contributors","subscribers_url":"https://api.github.com/repos/buildkite-demo-org/bazel/subscribers","subscription_url":"https://api.github.com/repos/buildkite-demo-org/bazel/subscription","commits_url":"https://api.github.com/repos/buildkite-demo-org/bazel/commits{/sha}","git_commits_url":"https://api.github.com/repos/buildkite-demo-org/bazel/git/commits{/sha}","comments_url":"https://api.github.com/repos/buildkite-demo-org/bazel/comments{/number}","issue_comment_url":"https://api.github.com/repos/buildkite-demo-org/bazel/issues/comments{/number}","contents_url":"https://api.github.com/repos/buildkite-demo-org/bazel/contents/{+path}","compare_url":"https://api.github.com/repos/buildkite-demo-org/bazel/compare/{base}...{head}","merges_url":"https://api.github.com/repos/buildkite-demo-org/bazel/merges","archive_url":"https://api.github.com/repos/buildkite-demo-org/bazel/{archive_format}{/ref}","downloads_url":"https://api.github.com/repos/buildkite-demo-org/bazel/downloads","issues_url":"https://api.github.com/repos/buildkite-demo-org/bazel/issues{/number}","pulls_url":"https://api.github.com/repos/buildkite-demo-org/bazel/pulls{/number}","milestones_url":"https://api.github.com/repos/buildkite-demo-org/bazel/milestones{/number}","notifications_url":"https://api.github.com/repos/buildkite-demo-org/bazel/notifications{?since,all,participating}","labels_url":"https://api.github.com/repos/buildkite-demo-org/bazel/labels{/name}","releases_url":"https://api.github.com/repos/buildkite-demo-org/bazel/releases{/id}","deployments_url":"https://api.github.com/repos/buildkite-demo-org/bazel/deployments","created_at":"2024-11-11T13:25:21Z","updated_at":"2024-11-26T08:56:43Z","pushed_at":"2024-11-27T15:19:02Z","git_url":"git://github.com/buildkite-demo-org/bazel.git","ssh_url":"git@github.com:buildkite-demo-org/bazel.git","clone_url":"https://github.com/buildkite-demo-org/bazel.git","svn_url":"https://github.com/buildkite-demo-org/bazel","homepage":"https://bazel.build","size":928517,"stargazers_count":0,"watchers_count":0,"language":"Java","has_issues":False,"has_projects":True,"has_downloads":True,"has_wiki":True,"has_pages":False,"has_discussions":False,"forks_count":1,"mirror_url":None,"archived":False,"disabled":False,"open_issues_count":3,"license":{"key":"apache-2.0","name":"Apache License 2.0","spdx_id":"Apache-2.0","url":"https://api.github.com/licenses/apache-2.0","node_id":"MDc6TGljZW5zZTI="},"allow_forking":True,"is_template":False,"web_commit_signoff_required":False,"topics":[],"visibility":"public","forks":1,"open_issues":3,"watchers":0,"default_branch":"master","allow_squash_merge":True,"allow_merge_commit":True,"allow_rebase_merge":True,"allow_auto_merge":False,"delete_branch_on_merge":False,"allow_update_branch":False,"use_squash_pr_title_as_default":False,"squash_merge_commit_message":"COMMIT_MESSAGES","squash_merge_commit_title":"COMMIT_OR_PR_TITLE","merge_commit_message":"PR_TITLE","merge_commit_title":"MERGE_MESSAGE"}},"base":{"label":"buildkite-demo-org:master","ref":"master","sha":"2aac26f48791596b6c1dae593ef5d22d48d1ea22","user":{"login":"buildkite-demo-org","id":188066006,"node_id":"O_kgDOCzWo1g","avatar_url":"https://avatars.githubusercontent.com/u/188066006?v=4","gravatar_id":"","url":"https://api.github.com/users/buildkite-demo-org","html_url":"https://github.com/buildkite-demo-org","followers_url":"https://api.github.com/users/buildkite-demo-org/followers","following_url":"https://api.github.com/users/buildkite-demo-org/following{/other_user}","gists_url":"https://api.github.com/users/buildkite-demo-org/gists{/gist_id}","starred_url":"https://api.github.com/users/buildkite-demo-org/starred{/owner}{/repo}","subscriptions_url":"https://api.github.com/users/buildkite-demo-org/subscriptions","organizations_url":"https://api.github.com/users/buildkite-demo-org/orgs","repos_url":"https://api.github.com/users/buildkite-demo-org/repos","events_url":"https://api.github.com/users/buildkite-demo-org/events{/privacy}","received_events_url":"https://api.github.com/users/buildkite-demo-org/received_events","type":"Organization","user_view_type":"public","site_admin":False},"repo":{"id":886713962,"node_id":"R_kgDONNouag","name":"bazel","full_name":"buildkite-demo-org/bazel","private":False,"owner":{"login":"buildkite-demo-org","id":188066006,"node_id":"O_kgDOCzWo1g","avatar_url":"https://avatars.githubusercontent.com/u/188066006?v=4","gravatar_id":"","url":"https://api.github.com/users/buildkite-demo-org","html_url":"https://github.com/buildkite-demo-org","followers_url":"https://api.github.com/users/buildkite-demo-org/followers","following_url":"https://api.github.com/users/buildkite-demo-org/following{/other_user}","gists_url":"https://api.github.com/users/buildkite-demo-org/gists{/gist_id}","starred_url":"https://api.github.com/users/buildkite-demo-org/starred{/owner}{/repo}","subscriptions_url":"https://api.github.com/users/buildkite-demo-org/subscriptions","organizations_url":"https://api.github.com/users/buildkite-demo-org/orgs","repos_url":"https://api.github.com/users/buildkite-demo-org/repos","events_url":"https://api.github.com/users/buildkite-demo-org/events{/privacy}","received_events_url":"https://api.github.com/users/buildkite-demo-org/received_events","type":"Organization","user_view_type":"public","site_admin":False},"html_url":"https://github.com/buildkite-demo-org/bazel","description":"a fast, scalable, multi-language and extensible build system","fork":True,"url":"https://api.github.com/repos/buildkite-demo-org/bazel","forks_url":"https://api.github.com/repos/buildkite-demo-org/bazel/forks","keys_url":"https://api.github.com/repos/buildkite-demo-org/bazel/keys{/key_id}","collaborators_url":"https://api.github.com/repos/buildkite-demo-org/bazel/collaborators{/collaborator}","teams_url":"https://api.github.com/repos/buildkite-demo-org/bazel/teams","hooks_url":"https://api.github.com/repos/buildkite-demo-org/bazel/hooks","issue_events_url":"https://api.github.com/repos/buildkite-demo-org/bazel/issues/events{/number}","events_url":"https://api.github.com/repos/buildkite-demo-org/bazel/events","assignees_url":"https://api.github.com/repos/buildkite-demo-org/bazel/assignees{/user}","branches_url":"https://api.github.com/repos/buildkite-demo-org/bazel/branches{/branch}","tags_url":"https://api.github.com/repos/buildkite-demo-org/bazel/tags","blobs_url":"https://api.github.com/repos/buildkite-demo-org/bazel/git/blobs{/sha}","git_tags_url":"https://api.github.com/repos/buildkite-demo-org/bazel/git/tags{/sha}","git_refs_url":"https://api.github.com/repos/buildkite-demo-org/bazel/git/refs{/sha}","trees_url":"https://api.github.com/repos/buildkite-demo-org/bazel/git/trees{/sha}","statuses_url":"https://api.github.com/repos/buildkite-demo-org/bazel/statuses/{sha}","languages_url":"https://api.github.com/repos/buildkite-demo-org/bazel/languages","stargazers_url":"https://api.github.com/repos/buildkite-demo-org/bazel/stargazers","contributors_url":"https://api.github.com/repos/buildkite-demo-org/bazel/contributors","subscribers_url":"https://api.github.com/repos/buildkite-demo-org/bazel/subscribers","subscription_url":"https://api.github.com/repos/buildkite-demo-org/bazel/subscription","commits_url":"https://api.github.com/repos/buildkite-demo-org/bazel/commits{/sha}","git_commits_url":"https://api.github.com/repos/buildkite-demo-org/bazel/git/commits{/sha}","comments_url":"https://api.github.com/repos/buildkite-demo-org/bazel/comments{/number}","issue_comment_url":"https://api.github.com/repos/buildkite-demo-org/bazel/issues/comments{/number}","contents_url":"https://api.github.com/repos/buildkite-demo-org/bazel/contents/{+path}","compare_url":"https://api.github.com/repos/buildkite-demo-org/bazel/compare/{base}...{head}","merges_url":"https://api.github.com/repos/buildkite-demo-org/bazel/merges","archive_url":"https://api.github.com/repos/buildkite-demo-org/bazel/{archive_format}{/ref}","downloads_url":"https://api.github.com/repos/buildkite-demo-org/bazel/downloads","issues_url":"https://api.github.com/repos/buildkite-demo-org/bazel/issues{/number}","pulls_url":"https://api.github.com/repos/buildkite-demo-org/bazel/pulls{/number}","milestones_url":"https://api.github.com/repos/buildkite-demo-org/bazel/milestones{/number}","notifications_url":"https://api.github.com/repos/buildkite-demo-org/bazel/notifications{?since,all,participating}","labels_url":"https://api.github.com/repos/buildkite-demo-org/bazel/labels{/name}","releases_url":"https://api.github.com/repos/buildkite-demo-org/bazel/releases{/id}","deployments_url":"https://api.github.com/repos/buildkite-demo-org/bazel/deployments","created_at":"2024-11-11T13:25:21Z","updated_at":"2024-11-26T08:56:43Z","pushed_at":"2024-11-27T15:19:02Z","git_url":"git://github.com/buildkite-demo-org/bazel.git","ssh_url":"git@github.com:buildkite-demo-org/bazel.git","clone_url":"https://github.com/buildkite-demo-org/bazel.git","svn_url":"https://github.com/buildkite-demo-org/bazel","homepage":"https://bazel.build","size":928517,"stargazers_count":0,"watchers_count":0,"language":"Java","has_issues":False,"has_projects":True,"has_downloads":True,"has_wiki":True,"has_pages":False,"has_discussions":False,"forks_count":1,"mirror_url":None,"archived":False,"disabled":False,"open_issues_count":3,"license":{"key":"apache-2.0","name":"Apache License 2.0","spdx_id":"Apache-2.0","url":"https://api.github.com/licenses/apache-2.0","node_id":"MDc6TGljZW5zZTI="},"allow_forking":True,"is_template":False,"web_commit_signoff_required":False,"topics":[],"visibility":"public","forks":1,"open_issues":3,"watchers":0,"default_branch":"master","allow_squash_merge":True,"allow_merge_commit":True,"allow_rebase_merge":True,"allow_auto_merge":False,"delete_branch_on_merge":False,"allow_update_branch":False,"use_squash_pr_title_as_default":False,"squash_merge_commit_message":"COMMIT_MESSAGES","squash_merge_commit_title":"COMMIT_OR_PR_TITLE","merge_commit_message":"PR_TITLE","merge_commit_title":"MERGE_MESSAGE"}},"_links":{"self":{"href":"https://api.github.com/repos/buildkite-demo-org/bazel/pulls/4"},"html":{"href":"https://github.com/buildkite-demo-org/bazel/pull/4"},"issue":{"href":"https://api.github.com/repos/buildkite-demo-org/bazel/issues/4"},"comments":{"href":"https://api.github.com/repos/buildkite-demo-org/bazel/issues/4/comments"},"review_comments":{"href":"https://api.github.com/repos/buildkite-demo-org/bazel/pulls/4/comments"},"review_comment":{"href":"https://api.github.com/repos/buildkite-demo-org/bazel/pulls/comments{/number}"},"commits":{"href":"https://api.github.com/repos/buildkite-demo-org/bazel/pulls/4/commits"},"statuses":{"href":"https://api.github.com/repos/buildkite-demo-org/bazel/statuses/9093e68d670fe57cb5423cfc56ff5ab483c873aa"}},"author_association":"COLLABORATOR","auto_merge":None,"active_lock_reason":None,"merged":False,"mergeable":None,"rebaseable":None,"mergeable_state":"unknown","merged_by":None,"comments":0,"review_comments":0,"maintainer_can_modify":False,"commits":1,"additions":2,"deletions":0,"changed_files":1},"repository":{"id":886713962,"node_id":"R_kgDONNouag","name":"bazel","full_name":"buildkite-demo-org/bazel","private":False,"owner":{"login":"buildkite-demo-org","id":188066006,"node_id":"O_kgDOCzWo1g","avatar_url":"https://avatars.githubusercontent.com/u/188066006?v=4","gravatar_id":"","url":"https://api.github.com/users/buildkite-demo-org","html_url":"https://github.com/buildkite-demo-org","followers_url":"https://api.github.com/users/buildkite-demo-org/followers","following_url":"https://api.github.com/users/buildkite-demo-org/following{/other_user}","gists_url":"https://api.github.com/users/buildkite-demo-org/gists{/gist_id}","starred_url":"https://api.github.com/users/buildkite-demo-org/starred{/owner}{/repo}","subscriptions_url":"https://api.github.com/users/buildkite-demo-org/subscriptions","organizations_url":"https://api.github.com/users/buildkite-demo-org/orgs","repos_url":"https://api.github.com/users/buildkite-demo-org/repos","events_url":"https://api.github.com/users/buildkite-demo-org/events{/privacy}","received_events_url":"https://api.github.com/users/buildkite-demo-org/received_events","type":"Organization","user_view_type":"public","site_admin":False},"html_url":"https://github.com/buildkite-demo-org/bazel","description":"a fast, scalable, multi-language and extensible build system","fork":True,"url":"https://api.github.com/repos/buildkite-demo-org/bazel","forks_url":"https://api.github.com/repos/buildkite-demo-org/bazel/forks","keys_url":"https://api.github.com/repos/buildkite-demo-org/bazel/keys{/key_id}","collaborators_url":"https://api.github.com/repos/buildkite-demo-org/bazel/collaborators{/collaborator}","teams_url":"https://api.github.com/repos/buildkite-demo-org/bazel/teams","hooks_url":"https://api.github.com/repos/buildkite-demo-org/bazel/hooks","issue_events_url":"https://api.github.com/repos/buildkite-demo-org/bazel/issues/events{/number}","events_url":"https://api.github.com/repos/buildkite-demo-org/bazel/events","assignees_url":"https://api.github.com/repos/buildkite-demo-org/bazel/assignees{/user}","branches_url":"https://api.github.com/repos/buildkite-demo-org/bazel/branches{/branch}","tags_url":"https://api.github.com/repos/buildkite-demo-org/bazel/tags","blobs_url":"https://api.github.com/repos/buildkite-demo-org/bazel/git/blobs{/sha}","git_tags_url":"https://api.github.com/repos/buildkite-demo-org/bazel/git/tags{/sha}","git_refs_url":"https://api.github.com/repos/buildkite-demo-org/bazel/git/refs{/sha}","trees_url":"https://api.github.com/repos/buildkite-demo-org/bazel/git/trees{/sha}","statuses_url":"https://api.github.com/repos/buildkite-demo-org/bazel/statuses/{sha}","languages_url":"https://api.github.com/repos/buildkite-demo-org/bazel/languages","stargazers_url":"https://api.github.com/repos/buildkite-demo-org/bazel/stargazers","contributors_url":"https://api.github.com/repos/buildkite-demo-org/bazel/contributors","subscribers_url":"https://api.github.com/repos/buildkite-demo-org/bazel/subscribers","subscription_url":"https://api.github.com/repos/buildkite-demo-org/bazel/subscription","commits_url":"https://api.github.com/repos/buildkite-demo-org/bazel/commits{/sha}","git_commits_url":"https://api.github.com/repos/buildkite-demo-org/bazel/git/commits{/sha}","comments_url":"https://api.github.com/repos/buildkite-demo-org/bazel/comments{/number}","issue_comment_url":"https://api.github.com/repos/buildkite-demo-org/bazel/issues/comments{/number}","contents_url":"https://api.github.com/repos/buildkite-demo-org/bazel/contents/{+path}","compare_url":"https://api.github.com/repos/buildkite-demo-org/bazel/compare/{base}...{head}","merges_url":"https://api.github.com/repos/buildkite-demo-org/bazel/merges","archive_url":"https://api.github.com/repos/buildkite-demo-org/bazel/{archive_format}{/ref}","downloads_url":"https://api.github.com/repos/buildkite-demo-org/bazel/downloads","issues_url":"https://api.github.com/repos/buildkite-demo-org/bazel/issues{/number}","pulls_url":"https://api.github.com/repos/buildkite-demo-org/bazel/pulls{/number}","milestones_url":"https://api.github.com/repos/buildkite-demo-org/bazel/milestones{/number}","notifications_url":"https://api.github.com/repos/buildkite-demo-org/bazel/notifications{?since,all,participating}","labels_url":"https://api.github.com/repos/buildkite-demo-org/bazel/labels{/name}","releases_url":"https://api.github.com/repos/buildkite-demo-org/bazel/releases{/id}","deployments_url":"https://api.github.com/repos/buildkite-demo-org/bazel/deployments","created_at":"2024-11-11T13:25:21Z","updated_at":"2024-11-26T08:56:43Z","pushed_at":"2024-11-27T15:19:02Z","git_url":"git://github.com/buildkite-demo-org/bazel.git","ssh_url":"git@github.com:buildkite-demo-org/bazel.git","clone_url":"https://github.com/buildkite-demo-org/bazel.git","svn_url":"https://github.com/buildkite-demo-org/bazel","homepage":"https://bazel.build","size":928517,"stargazers_count":0,"watchers_count":0,"language":"Java","has_issues":False,"has_projects":True,"has_downloads":True,"has_wiki":True,"has_pages":False,"has_discussions":False,"forks_count":1,"mirror_url":None,"archived":False,"disabled":False,"open_issues_count":3,"license":{"key":"apache-2.0","name":"Apache License 2.0","spdx_id":"Apache-2.0","url":"https://api.github.com/licenses/apache-2.0","node_id":"MDc6TGljZW5zZTI="},"allow_forking":True,"is_template":False,"web_commit_signoff_required":False,"topics":[],"visibility":"public","forks":1,"open_issues":3,"watchers":0,"default_branch":"master","custom_properties":{}},"organization":{"login":"buildkite-demo-org","id":188066006,"node_id":"O_kgDOCzWo1g","url":"https://api.github.com/orgs/buildkite-demo-org","repos_url":"https://api.github.com/orgs/buildkite-demo-org/repos","events_url":"https://api.github.com/orgs/buildkite-demo-org/events","hooks_url":"https://api.github.com/orgs/buildkite-demo-org/hooks","issues_url":"https://api.github.com/orgs/buildkite-demo-org/issues","members_url":"https://api.github.com/orgs/buildkite-demo-org/members{/member}","public_members_url":"https://api.github.com/orgs/buildkite-demo-org/public_members{/member}","avatar_url":"https://avatars.githubusercontent.com/u/188066006?v=4","description":None},"sender":{"login":"simonrummert","id":43201070,"node_id":"MDQ6VXNlcjQzMjAxMDcw","avatar_url":"https://avatars.githubusercontent.com/u/43201070?v=4","gravatar_id":"","url":"https://api.github.com/users/simonrummert","html_url":"https://github.com/simonrummert","followers_url":"https://api.github.com/users/simonrummert/followers","following_url":"https://api.github.com/users/simonrummert/following{/other_user}","gists_url":"https://api.github.com/users/simonrummert/gists{/gist_id}","starred_url":"https://api.github.com/users/simonrummert/starred{/owner}{/repo}","subscriptions_url":"https://api.github.com/users/simonrummert/subscriptions","organizations_url":"https://api.github.com/users/simonrummert/orgs","repos_url":"https://api.github.com/users/simonrummert/repos","events_url":"https://api.github.com/users/simonrummert/events{/privacy}","received_events_url":"https://api.github.com/users/simonrummert/received_events","type":"User","user_view_type":"public","site_admin":False},"installation":{"id":57682716,"node_id":"MDIzOkludGVncmF0aW9uSW5zdGFsbGF0aW9uNTc2ODI3MTY="}}}
-    # payload = payload["payload"]
-    # handle_pull_requests(payload)

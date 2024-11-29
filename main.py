@@ -1,10 +1,13 @@
 import os
 import datetime
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Set, List
 
+from pybuildkite import buildkite
 from pybuildkite.buildkite import Buildkite
 from flask import Flask, request
 from dotenv import load_dotenv
+from pybuildkite.pipelines import Pipelines
+
 from constants import BUILDKITE_ORGANISATION, BAZEL_BUILD_PIPELINE
 from github_connector import CheckRunConclusion, GitHubConnector, CheckRunStatus, Pipeline, CheckRunOutput
 
@@ -25,10 +28,9 @@ def setup_buildkite(token: str) -> Buildkite:
     return buildkite
 
 
-buildkite: Buildkite = setup_buildkite(get_token())
-github_connector: GitHubConnector = GitHubConnector()
-
-builds = {}
+BUILDKITE: Buildkite = setup_buildkite(get_token())
+GITHUB_CONNECTOR: GitHubConnector = GitHubConnector()
+BUILDS = {}
 
 
 def is_pull_request_changed(action: str) -> bool:
@@ -44,17 +46,36 @@ def extract_branch_name_from_payload(pr_json_payload: Dict[str, Any]) -> str:
     return pr_json_payload["pull_request"]["head"]["ref"]
 
 
+def fetch_repo_pipelines(repo_full_name: str) -> Set[str]:
+    pipelines: Pipelines = BUILDKITE.pipelines().list_pipelines(BUILDKITE_ORGANISATION)
+    return set([pipeline["slug"] for pipeline in pipelines if repo_full_name in pipeline["repository"]])
+
+
 def trigger_build(
-    buildkite: Buildkite, commit_sha: str, branch: str, build_message: str
-) -> Any:
-    return buildkite.builds().create_build(
-        BUILDKITE_ORGANISATION,
-        BAZEL_BUILD_PIPELINE,
-        commit_sha,
-        branch,
-        clean_checkout=True,
-        message=build_message,
-    )
+        buildkite: Buildkite, repository_name: str, commit_sha: str, branch: str, build_message: str
+) -> List[Any]:
+    pipeline_set: Set[str] = fetch_repo_pipelines(repository_name)
+    build_list: List[Any] = []
+
+    try:
+
+        pipeline: str
+        for pipeline in pipeline_set:
+            build_list.append(buildkite.builds().create_build(
+                BUILDKITE_ORGANISATION,
+                pipeline,
+                commit_sha,
+                branch,
+                clean_checkout=True,
+                message=build_message,
+                ignore_pipeline_branch_filters=True
+            ))
+
+        return build_list
+
+    except Exception as error:
+        print(error)
+        raise error
 
 
 def extract_repository_name(pr_json_payload: Dict[str, Any]) -> str:
@@ -71,7 +92,7 @@ def handle_pull_requests(pr_json_payload: Dict[str, Any]) -> None:
     pull_request_number: int = extract_pr_number(pr_json_payload)
 
     if is_pull_request_changed(action):
-        github_connector.update_checks_page(
+        GITHUB_CONNECTOR.update_checks_page(
             repo_name=repository_name,
             check_name=Pipeline.CHECK,
             pull_request_number=pull_request_number,
@@ -80,10 +101,25 @@ def handle_pull_requests(pr_json_payload: Dict[str, Any]) -> None:
         )
         build_message: str = generate_build_message_from_payload(pr_json_payload)
         branch: str = extract_branch_name_from_payload(pr_json_payload)
-        build = trigger_build(
-            buildkite, commit_sha="HEAD", branch=branch, build_message=build_message
+        build_list: List[Any] = trigger_build(
+            BUILDKITE, repository_name=repository_name, commit_sha="HEAD", branch=branch, build_message=build_message
         )
-        builds[build["id"]] = (build, pr_json_payload)
+
+        for build in build_list:
+            BUILDS[build["id"]] = (build, pr_json_payload)
+
+
+def handle_check_run(check_run_payload: Dict[str, Any]) -> None:
+    action: str = check_run_payload["action"]
+    pipeline: str = check_run_payload["check_run"]["name"]
+    conclusion: str = check_run_payload["check_run"]["conclusion"]
+
+    if action == CheckRunStatus.COMPLETED and pipeline == Pipeline.CHECK and conclusion == CheckRunConclusion.SUCCESS:
+        repo_name: str = check_run_payload["repository"]["full_name"]
+        pr_number: int = int(check_run_payload["check_run"]["pull_requests"][0]["number"])
+
+        if GITHUB_CONNECTOR.attempt_merge(repo_name=repo_name, pr_number=pr_number):
+            print(f"Pull Request: #{pr_number} was merged!")
 
 
 @app.route("/github_webhooks", methods=["POST"])
@@ -94,21 +130,24 @@ def github_entrypoint():
     if request_header == "pull_request":
         handle_pull_requests(payload)
 
+    if request_header == "check_run":
+        handle_check_run(payload)
+
     return "OK"
 
 
 def handle_build_running(payload: Dict[str, Any]):
     build_id = payload["build"]["id"]
 
-    if build_id in builds:
+    if build_id in BUILDS:
         print(f"Build {build_id} running!")
-        _, pull_request = builds[build_id]
+        _, pull_request = BUILDS[build_id]
         repository = pull_request["repository"]["full_name"]
         check_name = Pipeline.CHECK
         pr_number = pull_request["number"]
         status = CheckRunStatus.IN_PROGRESS
         # output = CheckRunOutput.PENDING_CHECK
-        github_connector.update_checks_page(
+        GITHUB_CONNECTOR.update_checks_page(
             repo_name=repository,
             check_name=check_name,
             pull_request_number=pr_number,
@@ -122,15 +161,15 @@ def handle_build_running(payload: Dict[str, Any]):
 def handle_build_finished(payload: Dict[str, Any]):
     build_id = payload["build"]["id"]
     build_result = payload["build"]["state"]
-    
+
     if build_result == "passed":
         conclusion = CheckRunConclusion.SUCCESS
         output = CheckRunOutput.SUCCESSFUL_CHECK
-    
+
     elif build_result == "canceled":
         conclusion = CheckRunConclusion.CANCELLED
         output = CheckRunOutput.CANCELED_CHECK
-    
+
     elif build_result == "failed":
         conclusion = CheckRunConclusion.FAILURE
         output = CheckRunOutput.FAILED_CHECK
@@ -138,9 +177,9 @@ def handle_build_finished(payload: Dict[str, Any]):
         print(f"Unhandled build result {build_result}")
         return
 
-    if build_id in builds:
+    if build_id in BUILDS:
         print(f"Build {build_id} has finished with result {conclusion}!")
-        _, pull_request = builds[build_id]
+        _, pull_request = BUILDS[build_id]
         repository = pull_request["repository"]["full_name"]
         check_name = Pipeline.CHECK
         pr_number = pull_request["number"]
@@ -148,8 +187,8 @@ def handle_build_finished(payload: Dict[str, Any]):
         conclusion = conclusion
         completed_at = datetime.datetime.strptime(payload["build"]["finished_at"], "%Y-%m-%dT%H:%M:%S.%fZ")
         output = output
-        
-        github_connector.update_checks_page(
+
+        GITHUB_CONNECTOR.update_checks_page(
             repo_name=repository,
             check_name=check_name,
             pull_request_number=pr_number,
@@ -158,12 +197,12 @@ def handle_build_finished(payload: Dict[str, Any]):
             completed_at=completed_at,
             output=output,
         )
-        
-        del builds[build_id]
 
+        del BUILDS[build_id]
 
 
 def handle_build_canceled(payload: Dict[str, Any]):
+    print("Not implemented!")
     pass
 
 
@@ -179,10 +218,10 @@ def buildkite_entrypoint():
         handle_build_finished(payload)
 
     elif request_header == "build.failing":
-        handle_build_failing(payload)
+        handle_build_canceled(payload)
 
     return "OK"
 
 
 if __name__ == "__main__":
-    app.run(port=5000)
+    app.run(port=5000, debug=True)

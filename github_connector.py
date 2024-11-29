@@ -6,10 +6,12 @@ from typing import Dict, Optional, Tuple
 from github import Github, GithubIntegration, CheckRun
 import datetime
 
+from github.CheckSuite import CheckSuite
 from github.GithubObject import NotSet
 from github.Installation import Installation
 from github.PaginatedList import PaginatedList
 from github.PullRequest import PullRequest
+from github.PullRequestMergeStatus import PullRequestMergeStatus
 from github.Repository import Repository
 
 from constants import GITHUB_APP_ID
@@ -177,6 +179,15 @@ class GitHubConnector:
             output=output,
         )
         check_run.update()
+
+    def attempt_merge(self, repo_name: str, pr_number: int) -> bool:
+        repo: Repository = self.github.get_repo(repo_name)
+        pull_request: PullRequest = repo.get_pull(pr_number)
+
+        if pull_request.mergeable:
+            pull_request.merge()
+            return True
+        return False
 
 
 # Main function to be called with the necessary parameters

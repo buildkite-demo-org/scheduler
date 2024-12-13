@@ -6,11 +6,15 @@ from typing import Dict, Optional, Tuple
 from github import Github, GithubIntegration, CheckRun
 import datetime
 
+from github.GithubException import GithubException
+from github.CheckSuite import CheckSuite
 from github.GithubObject import NotSet
 from github.Installation import Installation
 from github.PaginatedList import PaginatedList
 from github.PullRequest import PullRequest
+from github.PullRequestMergeStatus import PullRequestMergeStatus
 from github.Repository import Repository
+import requests
 
 from constants import GITHUB_APP_ID
 
@@ -55,14 +59,13 @@ class CheckRunStatus(str, Enum):
 
 class GitHubConnector:
     def __init__(self):
+        self.commit_sha_to_checkrun_id_dict: Dict[str, int] = {}
+        self.graphql_url = "https://api.github.com/graphql"
         self.installation: Installation = self.fetch_installation()
         private_key: str = self.read_private_key(PRIVATE_KEY_PATH)
         self.github = self.authenticate_as_github_app(
             GITHUB_APP_ID, self.installation.id, private_key
         )
-        self.pr_id_to_check_run_id_dict: Dict[
-            (str, str, int), int
-        ] = {}  # (repo_name, check_name, pr_number) -> check_run_id
 
     @staticmethod
     def read_private_key(private_key_path: Path) -> str:
@@ -95,24 +98,15 @@ class GitHubConnector:
         self,
         repo_name: str,
         check_name: Pipeline,
-        pull_request_number: int,
+        commit_sha: int,
         status: CheckRunStatus,
         conclusion: CheckRunConclusion | None = None,
         completed_at: datetime.datetime | None = None,
         output: CheckRunOutput | None = None,
     ):
         repo: Repository = self.github.get_repo(repo_name)
-        head_sha: str = self.get_head_commit_sha_for_pull_request(
-            repo, pull_request_number
-        )
-        check_run_tuple: Tuple[str, str, int] = (
-            repo_name,
-            check_name,
-            pull_request_number,
-        )
 
-        if check_run_tuple in self.pr_id_to_check_run_id_dict.keys():
-            check_run_id: int = self.pr_id_to_check_run_id_dict[check_run_tuple]
+        if check_run_id := self.commit_sha_to_checkrun_id_dict.get(commit_sha):
             self.edit_checks_page(
                 repository=repo,
                 check_run_id=check_run_id,
@@ -123,17 +117,17 @@ class GitHubConnector:
             )
 
             if conclusion and completed_at:
-                del self.pr_id_to_check_run_id_dict[check_run_tuple]
+                del self.commit_sha_to_checkrun_id_dict[commit_sha]
 
         else:
             check_run_id: int = self.init_checks_page(
                 repository=repo,
                 check_name=check_name,
-                commit_sha=head_sha,
+                commit_sha=commit_sha,
                 status=status,
                 output=output,
             )
-            self.pr_id_to_check_run_id_dict[check_run_tuple] = check_run_id
+            self.commit_sha_to_checkrun_id_dict[commit_sha] = check_run_id
 
     @staticmethod
     def init_checks_page(
@@ -178,56 +172,44 @@ class GitHubConnector:
         )
         check_run.update()
 
+    def attempt_merge(self, repo_name: str, pr_number: int) -> bool:
+        repo: Repository = self.github.get_repo(repo_name)
+        pull_request: PullRequest = repo.get_pull(pr_number)
 
-# Main function to be called with the necessary parameters
-def demo_github_connector():
-    github = GitHubConnector()
-    repo_name = "buildkite-demo-org/scheduler"  # Replace with your repository name
+        if pull_request.mergeable:
+            # Please don't look at this
+            try:
+                pull_request.merge()
+                return True
+            except GithubException as error:
+                response = self.enqueue_pull_request(pull_request.node_id)
+                if errors := response.get("errors"):
+                    print(f"Pull Request merge failed! Errors: {errors}")
+                    return False
+                return True
+        return False
 
-    # Check
-    github.update_checks_page(
-        repo_name=repo_name,
-        check_name=Pipeline.CHECK,
-        pull_request_number=3,
-        status=CheckRunStatus.IN_PROGRESS,
-        conclusion=None,
-        output=CheckRunOutput.PENDING_CHECK,
-    )
-
-    time.sleep(5)
-
-    github.update_checks_page(
-        repo_name=repo_name,
-        check_name=Pipeline.CHECK,
-        pull_request_number=3,
-        status=CheckRunStatus.COMPLETED,
-        conclusion=CheckRunConclusion.SUCCESS,
-        output=CheckRunOutput.SUCCESSFUL_CHECK,
-    )
-
-    time.sleep(1)
-
-    # Gate
-    github.update_checks_page(
-        repo_name=repo_name,
-        check_name=Pipeline.GATE,
-        pull_request_number=3,
-        status=CheckRunStatus.IN_PROGRESS,
-        conclusion=None,
-        output=CheckRunOutput.PENDING_GATE,
-    )
-
-    time.sleep(5)
-
-    github.update_checks_page(
-        repo_name=repo_name,
-        check_name=Pipeline.GATE,
-        pull_request_number=3,
-        status=CheckRunStatus.COMPLETED,
-        conclusion=CheckRunConclusion.FAILURE,
-        output=CheckRunOutput.FAILED_GATE,
-    )
-
-
-if __name__ == "__main__":
-    demo_github_connector()
+    def enqueue_pull_request(self, pull_request_id: str):
+        graphql_query = """
+        mutation {
+            enqueuePullRequest(input: {pullRequestId: "%s"}){
+                clientMutationId
+                mergeQueueEntry {
+                    id
+                    pullRequest {
+                        title
+                        number
+                    }
+                }
+            }
+        }
+        """
+        query = {"query": graphql_query % pull_request_id}
+        headers = {"Authorization": f"bearer %s" % self.github.requester.auth.token}
+        response = requests.post(
+            url=self.graphql_url,
+            json=query,
+            headers=headers,
+        )
+        response.raise_for_status()
+        return response.json()
